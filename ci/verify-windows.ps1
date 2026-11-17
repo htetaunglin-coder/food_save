@@ -1,10 +1,11 @@
 # Runs every local-setup script the way the student and Codex run them, on real Windows,
 # and asserts the result of each scenario. Needs: Java 21 on PATH, MySQL on 3306 with
 # root password $Password, mysql.exe on PATH. Run from the repo root (a path with spaces).
-param([string]$Password = 'My Pass\word#1')
+param([string]$Password = ' My Pass\word#1')
 
 $ErrorActionPreference = 'Continue'
 $repo = (Get-Location).Path
+. (Join-Path $repo 'scripts\props.ps1')
 $props = Join-Path $repo 'backend\local.properties'
 $results = New-Object System.Collections.ArrayList
 
@@ -46,7 +47,7 @@ function Healthy { try { return ((Invoke-RestMethod 'http://localhost:8080/api/h
 function PortOpen($port) { $c = New-Object Net.Sockets.TcpClient; try { $t = $c.ConnectAsync('127.0.0.1', $port); return ($t.Wait(1500) -and $c.Connected) } catch { return $false } finally { $c.Close() } }
 function Sql($query) { $env:MYSQL_PWD = $Password; $r = (& mysql -u root -h 127.0.0.1 -N -e $query 2>&1 | ForEach-Object { "$_" }) -join ' '; Remove-Item Env:MYSQL_PWD; return $r }
 function ServerPid { $c = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { return $c.OwningProcess } else { return $null } }
-function SaveProps($pw) { [IO.File]::WriteAllText($props, "spring.datasource.password=$($pw.Replace('\', '\\'))`r`n") }
+function SaveProps($pw) { Save-Password $props $pw }
 
 Write-Host "Repo: $repo"
 Write-Host "PowerShell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
@@ -56,20 +57,22 @@ Remove-Item $props -ErrorAction SilentlyContinue
 $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
 Check 'agent start without saved password stops with message' ($r.Code -eq 1 -and $r.Text -match 'not saved yet') "exit $($r.Code)"
 
-# 2. Student types the password at the prompt. CI can only offer it on stdin; Read-Host
-#    -AsSecureString may read the console instead, so a timeout here is reported, not failed.
-$r = Run 'scripts\server.ps1' @('start', '-NoBrowser') "$Password" -TimeoutSec 120
-$saved = if (Test-Path $props) { Get-Content $props -Raw } else { '' }
-if ($r.Exited) {
-    Check 'password typed at the prompt is saved with escaped backslash' ($saved -match [regex]::Escape('spring.datasource.password=' + $Password.Replace('\', '\\'))) ($saved -replace "`r|`n", ' ')
-} else {
-    Write-Host '===== INFO password prompt does not read piped stdin (console only); saving the file directly'
+# 2. The password the student types is written by Save-Password (the prompt itself reads the
+#    console only, so CI cannot type into it). It must survive the trip through Java's parser.
+$probe = Join-Path $env:TEMP 'probe.properties'
+$javaProbe = Join-Path $env:TEMP 'Probe.java'
+[IO.File]::WriteAllText($javaProbe, 'public class Probe { public static void main(String[] a) throws Exception { var p = new java.util.Properties(); try (var in = new java.io.FileInputStream(a[0])) { p.load(in); } p.getProperty("spring.datasource.password").chars().forEach(c -> System.out.print(c + " ")); } }')
+$samples = @($Password, 'plain', 'a=b:c!d#e', '  two leading spaces', ('caf' + [char]0x00E9 + ' ' + [char]0x0E01 + [char]0x0E32 + 'r'), 'back\\slash\u0041')
+foreach ($sample in $samples) {
+    Save-Password $probe $sample
+    $javaCodes = (& java $javaProbe $probe 2>&1 | ForEach-Object { "$_" }) -join ''
+    $expected = (($sample.ToCharArray() | ForEach-Object { [int]$_ }) -join ' ') + ' '
+    $fileAscii = -not ((Get-Content $probe -Raw) -match '[^\x00-\x7F]')
+    Check "saved password reads back exactly in Java: [$($sample -replace '[^\x20-\x7E]', '?')]" ($javaCodes -eq $expected -and $fileAscii -and (Read-SavedPassword $probe) -ceq $sample) "java [$javaCodes]"
 }
-if (-not ($r.Exited -and $r.Code -eq 0)) {
-    & (Join-Path $repo 'scripts\server.ps1') stop | Out-Null
-    SaveProps $Password
-    $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
-}
+
+SaveProps $Password
+$r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
 Check 'agent start exits 0 and reports running' ($r.Code -eq 0 -and $r.Text -match 'The store is running') "exit $($r.Code)"
 Check 'agent start closes its output pipe (agent does not hang)' ($r.Exited -and $r.PipeClosed)
 

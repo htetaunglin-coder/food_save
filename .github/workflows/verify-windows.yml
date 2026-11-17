@@ -16,9 +16,9 @@ jobs:
       - uses: ankane/setup-mysql@v1
         with:
           mysql-version: '8.4'
-      - name: Give root a password like the MySQL installer does
+      - name: Give root a password with a leading space, a space, a backslash and #
         shell: powershell
-        run: mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'My Pass\\word#1';"
+        run: mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY ' My Pass\\word#1';"
       - name: Copy the repo to a path with spaces
         shell: powershell
         run: |
