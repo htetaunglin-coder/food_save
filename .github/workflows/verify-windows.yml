@@ -1,0 +1,42 @@
+name: verify-windows
+on:
+  push:
+    branches: [verify-windows]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: ankane/setup-mysql@v1
+        with:
+          mysql-version: '8.4'
+      - name: Give root a password like the MySQL installer does
+        shell: powershell
+        run: mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'My Pass\\word#1';"
+      - name: Copy the repo to a path with spaces
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force 'C:\Student Folder' | Out-Null
+          Copy-Item -Recurse $env:GITHUB_WORKSPACE 'C:\Student Folder\food save'
+      - name: Run every script scenario (Windows PowerShell 5.1, no JAVA_HOME, Java on PATH)
+        shell: powershell
+        working-directory: C:\Student Folder\food save
+        run: |
+          Remove-Item Env:JAVA_HOME
+          java -version
+          .\ci\verify-windows.ps1
+      - name: Server log
+        if: always()
+        shell: powershell
+        run: Get-Content 'C:\Student Folder\food save\backend\logs\server.log' -Tail 60 -ErrorAction SilentlyContinue
+  railway-docker-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t food-save .
