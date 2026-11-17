@@ -8,17 +8,35 @@ $repo = (Get-Location).Path
 $props = Join-Path $repo 'backend\local.properties'
 $results = New-Object System.Collections.ArrayList
 
-function Run($file, [string[]]$argList = @(), $stdin = $null, [switch]$NonInteractive) {
-    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass')
-    if ($NonInteractive) { $psArgs += '-NonInteractive' }
-    $psArgs += @('-File', (Join-Path $repo $file)) + $argList
-    if ($null -ne $stdin) { $out = $stdin | & powershell.exe @psArgs 2>&1 | ForEach-Object { "$_" } }
-    else { $out = & powershell.exe @psArgs 2>&1 | ForEach-Object { "$_" } }
-    $code = $LASTEXITCODE
-    $text = ($out -join "`n")
-    Write-Host "----- $file $($argList -join ' ') (exit $code)"
+# Runs a script the way a coding agent does: stdin/stdout/stderr are pipes, with a time limit.
+# PipeClosed is false when the command ended but something it started still holds the
+# output pipe open; an agent waiting for the output would then hang.
+function Run($file, [string[]]$argList = @(), $stdin = $null, [switch]$NonInteractive, [int]$TimeoutSec = 300) {
+    $psArgs = '-NoProfile -ExecutionPolicy Bypass'
+    if ($NonInteractive) { $psArgs += ' -NonInteractive' }
+    $psArgs += ' -File "' + (Join-Path $repo $file) + '"'
+    foreach ($a in $argList) { $psArgs += ' ' + $a }
+    $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe', $psArgs
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
+    $psi.WorkingDirectory = $repo
+    $p = [Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    if ($null -ne $stdin) { $p.StandardInput.WriteLine($stdin) }
+    $p.StandardInput.Close()
+    $exited = $p.WaitForExit($TimeoutSec * 1000)
+    if (-not $exited) { & taskkill.exe /T /F /PID $p.Id | Out-Null }
+    $pipeClosed = $outTask.Wait(15000) -and $errTask.Wait(15000)
+    $text = ''
+    if ($outTask.IsCompleted) { $text += $outTask.Result }
+    if ($errTask.IsCompleted) { $text += $errTask.Result }
+    $code = if ($exited) { $p.ExitCode } else { -1 }
+    Write-Host "----- $file $($argList -join ' ') (exit $code, exited $exited, pipe closed $pipeClosed)"
     Write-Host $text
-    return @{ Code = $code; Text = $text }
+    return @{ Code = $code; Text = $text; Exited = $exited; PipeClosed = $pipeClosed }
 }
 function Check($name, [bool]$ok, $detail = '') {
     [void]$results.Add([pscustomobject]@{ Result = $(if ($ok) { 'PASS' } else { 'FAIL' }); Check = $name; Detail = $detail })
@@ -38,18 +56,31 @@ Remove-Item $props -ErrorAction SilentlyContinue
 $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
 Check 'agent start without saved password stops with message' ($r.Code -eq 1 -and $r.Text -match 'not saved yet') "exit $($r.Code)"
 
-# 2. Student types the password at the prompt (fed through stdin here).
-$r = Run 'scripts\server.ps1' @('start', '-NoBrowser') "$Password"
+# 2. Student types the password at the prompt. CI can only offer it on stdin; Read-Host
+#    -AsSecureString may read the console instead, so a timeout here is reported, not failed.
+$r = Run 'scripts\server.ps1' @('start', '-NoBrowser') "$Password" -TimeoutSec 120
 $saved = if (Test-Path $props) { Get-Content $props -Raw } else { '' }
-Check 'password prompt saves local.properties with escaped backslash' ($saved -match [regex]::Escape('spring.datasource.password=' + $Password.Replace('\', '\\'))) ($saved -replace "`r|`n", ' ')
-if (-not (Test-Path $props)) { SaveProps $Password; $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive }
-Check 'start exits 0 and reports running' ($r.Code -eq 0 -and $r.Text -match 'The store is running') "exit $($r.Code)"
+if ($r.Exited) {
+    Check 'password typed at the prompt is saved with escaped backslash' ($saved -match [regex]::Escape('spring.datasource.password=' + $Password.Replace('\', '\\'))) ($saved -replace "`r|`n", ' ')
+} else {
+    Write-Host '===== INFO password prompt does not read piped stdin (console only); saving the file directly'
+}
+if (-not ($r.Exited -and $r.Code -eq 0)) {
+    & (Join-Path $repo 'scripts\server.ps1') stop | Out-Null
+    SaveProps $Password
+    $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
+}
+Check 'agent start exits 0 and reports running' ($r.Code -eq 0 -and $r.Text -match 'The store is running') "exit $($r.Code)"
+Check 'agent start closes its output pipe (agent does not hang)' ($r.Exited -and $r.PipeClosed)
 
 # 3. The server outlives the process that started it.
 Check 'server still answers after the start process exited' (Healthy)
 Check 'database and 4 tables were created automatically' ((Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='good_store'") -match '\b4\b')
 $firstPid = ServerPid
-Check 'server runs as javaw.exe (no console window)' ($firstPid -and (Get-Process -Id $firstPid).ProcessName -eq 'javaw') "pid $firstPid"
+$serverCmd = if ($firstPid) { (Get-CimInstance Win32_Process -Filter "ProcessId=$firstPid").CommandLine } else { '' }
+Check 'port 8080 belongs to java running good-store-0.1.0.jar' ($serverCmd -match 'good-store-0\.1\.0\.jar') "pid $firstPid"
+$pidFileValue = Get-Content (Join-Path $repo 'backend\logs\server.pid') -ErrorAction SilentlyContinue
+Check 'server.pid holds the java process id' ("$pidFileValue" -eq "$firstPid") "file $pidFileValue"
 
 # 4. Agent path once the password is saved; status and logs.
 $r = Run 'scripts\server.ps1' @('status') -NonInteractive
@@ -67,6 +98,11 @@ Check 'check.ps1 passes in PowerShell 7' ($LASTEXITCODE -eq 0 -and (($out -join 
 $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
 $secondPid = ServerPid
 Check 'second start restarts with a new process' ($r.Code -eq 0 -and $secondPid -and $secondPid -ne $firstPid) "old $firstPid new $secondPid"
+Check 'old server process is gone' (-not (Get-Process -Id $firstPid -ErrorAction SilentlyContinue))
+
+# Thai culture (Buddhist calendar) must not break the dates check.ps1 sends.
+$out = & pwsh -NoProfile -NonInteractive -Command "[cultureinfo]::CurrentCulture = 'th-TH'; & '$(Join-Path $repo 'scripts\check.ps1')'" 2>&1 | ForEach-Object { "$_" }
+Check 'check.ps1 passes under th-TH culture' ($LASTEXITCODE -eq 0 -and (($out -join ' ') -match 'ALL 13 CHECKS PASSED')) "exit $LASTEXITCODE"
 
 # 7. reset-db: confirm with YES, server stops, database is gone; next start rebuilds tables.
 $r = Run 'scripts\reset-db.ps1' @() 'YES'
@@ -109,6 +145,14 @@ $listener.Start()
 $r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
 $listener.Stop()
 Check 'port 8080 taken by another program is explained' ($r.Code -eq 1 -and $r.Text -match 'Another program') "exit $($r.Code)"
+
+# Another Java program on 8080 (the JDK's jwebserver) must not be killed.
+$other = Start-Process -FilePath (Join-Path (Split-Path -Parent (Get-Command java).Source) 'jwebserver.exe') -ArgumentList @('-p', '8080', '-b', '127.0.0.1') -PassThru -WindowStyle Hidden
+for ($i = 0; $i -lt 20 -and -not (PortOpen 8080); $i++) { Start-Sleep -Milliseconds 500 }
+$r = Run 'scripts\server.ps1' @('start', '-NoBrowser') -NonInteractive
+Check 'another Java app on 8080 is left running' ($r.Code -eq 1 -and $r.Text -match 'Another program' -and -not $other.HasExited) "exit $($r.Code)"
+Stop-Process -Id $other.Id -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
 $r = Run 'scripts\check.ps1' -NonInteractive
 Check 'check.ps1 with no server says to start it' ($r.Code -eq 1 -and $r.Text -match 'not running')

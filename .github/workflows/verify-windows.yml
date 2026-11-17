@@ -24,6 +24,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force 'C:\Student Folder' | Out-Null
           Copy-Item -Recurse $env:GITHUB_WORKSPACE 'C:\Student Folder\food save'
+      - name: Maven Wrapper downloads Maven and builds (no Maven installed)
+        shell: powershell
+        working-directory: C:\Student Folder\food save\backend
+        run: |
+          .\mvnw.cmd -q -B -DskipTests package
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Run every script scenario (Windows PowerShell 5.1, no JAVA_HOME, Java on PATH)
         shell: powershell
         working-directory: C:\Student Folder\food save
